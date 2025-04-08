@@ -5,6 +5,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use std::io::{self, Write};
 
 use crate::bytes_range::BytesRange;
 use crate::db_state::{SsTableHandle, SsTableId};
@@ -301,6 +302,39 @@ impl<'a> SstIterator<'a> {
         Ok(())
     }
 
+    async fn advance_block_faster(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        if !self.state.is_finished() {
+            println!("advance_block_faster");
+            let index = self.index.clone();
+            let block_idx = partitioned_keyspace::first_partition_including_or_after_key(&index.borrow(), next_key);
+            let table = self.view.table_as_ref().clone();
+            let cache_blocks = self.options.cache_blocks;
+            let mut blocks = self.table_store
+                        .read_blocks_using_index(
+                            &table,
+                            index,
+                            block_idx..block_idx + 1,
+                            cache_blocks,
+                        )
+                        .await?;
+            println!("out0");
+            if let Some(block) = blocks.pop_front() {
+                println!("out1");
+                let mut iter = BlockIterator::new_ascending(block);
+                match self.view.start_key() {
+                    Included(start_key) | Excluded(start_key) => iter.seek(start_key).await?,
+                    Unbounded => (),
+                }
+                self.state.advance(iter);
+                println!("out2");
+            } else {
+                println!("out3");
+                self.state.stop();
+            }
+        }
+        Ok(())
+    }
+
     fn stop(&mut self) {
         let num_blocks = self.index.borrow().block_meta().len();
         self.next_block_idx_to_fetch = num_blocks;
@@ -348,7 +382,9 @@ impl SeekToKey for SstIterator<'_> {
                     break;
                 }
             }
-            self.advance_block().await?;
+            println!("advance_block_faster");
+            io::stderr().flush().unwrap();
+            self.advance_block_faster(next_key).await?;
         }
         Ok(())
     }

@@ -5,7 +5,6 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use std::io::{self, Write};
 
 use crate::bytes_range::BytesRange;
 use crate::db_state::{SsTableHandle, SsTableId};
@@ -302,33 +301,32 @@ impl<'a> SstIterator<'a> {
         Ok(())
     }
 
+    fn reset_fetch_tasks(&mut self, block_idx: usize) {
+        self.fetch_tasks.clear();
+        self.next_block_idx_to_fetch = block_idx;
+    }
+
     async fn advance_block_faster(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
         if !self.state.is_finished() {
-            println!("advance_block_faster");
             let index = self.index.clone();
-            let block_idx = partitioned_keyspace::first_partition_including_or_after_key(&index.borrow(), next_key);
+            let block_idx =
+                Self::first_block_with_data_including_or_after_key(&index.borrow(), next_key);
             let table = self.view.table_as_ref().clone();
-            let cache_blocks = self.options.cache_blocks;
-            let mut blocks = self.table_store
-                        .read_blocks_using_index(
-                            &table,
-                            index,
-                            block_idx..block_idx + 1,
-                            cache_blocks,
-                        )
-                        .await?;
-            println!("out0");
-            if let Some(block) = blocks.pop_front() {
-                println!("out1");
+            let mut block = self
+                .table_store
+                .read_blocks_using_index(
+                    &table,
+                    index,
+                    block_idx..block_idx + 1,
+                    self.options.cache_blocks,
+                )
+                .await?;
+            self.reset_fetch_tasks(block_idx + 1);
+            if let Some(block) = block.pop_front() {
                 let mut iter = BlockIterator::new_ascending(block);
-                match self.view.start_key() {
-                    Included(start_key) | Excluded(start_key) => iter.seek(start_key).await?,
-                    Unbounded => (),
-                }
+                iter.seek(next_key).await?;
                 self.state.advance(iter);
-                println!("out2");
             } else {
-                println!("out3");
                 self.state.stop();
             }
         }
@@ -374,16 +372,7 @@ impl SeekToKey for SstIterator<'_> {
                              next_key, self.view.start_key(), self.view.end_key())
             });
         }
-
-        while !self.state.is_finished() {
-            if let Some(iter) = self.state.current_iter.as_mut() {
-                iter.seek(next_key).await?;
-                if !iter.is_empty() {
-                    break;
-                }
-            }
-            println!("advance_block_faster");
-            io::stderr().flush().unwrap();
+        if !self.state.is_finished() {
             self.advance_block_faster(next_key).await?;
         }
         Ok(())

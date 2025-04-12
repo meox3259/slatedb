@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::io::{self, Write};
+
 use bytes::Bytes;
 use fail_parallel::FailPointRegistry;
 use object_store::path::Path;
@@ -1910,20 +1910,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_seek_fast_forwards_iterator() {
-        println!("start1");
-        io::stderr().flush().unwrap();
+    #[test]
+    fn test_seek_fast_forwards_iterator() {
         let mut runner = new_proptest_runner(None);
         let table = sample::table(runner.rng(), 1000, 10);
-        println!("start1");
-        io::stderr().flush().unwrap();
 
         let runtime = Runtime::new().unwrap();
         let db_options = test_db_options(0, 1024, None);
         let db = runtime.block_on(build_database_from_table(&table, db_options, true));
-        println!("start2");
-        io::stderr().flush().unwrap();
+
         runner
             .run(
                 &(arbitrary::nonempty_range(5), arbitrary::rng()),
@@ -1935,14 +1930,13 @@ mod tests {
                 },
             )
             .unwrap();
-        println!("114514");
+
         async fn assert_seek_fast_forwards_iterator(
             table: &BTreeMap<Bytes, Bytes>,
             db: &Db,
             scan_range: &BytesRange,
             rng: &mut TestRng,
         ) {
-            println!("1145141");
             let mut iter = db
                 .inner
                 .scan_with_options(scan_range.clone(), &ScanOptions::default())

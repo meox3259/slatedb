@@ -36,7 +36,7 @@ pub(crate) struct KVArray {
   last_seq: AtomicU64,
 }
 
-impl MemTableIterator {
+impl SegmentIterator {
   pub(crate) fn next_entry_sync(&mut self) -> Option<RowEntry> {
       let ans = self.borrow_item().clone();
       let next_entry = match self.borrow_ordering() {
@@ -52,8 +52,8 @@ impl MemTableIterator {
 }
 
 #[self_referencing]
-pub(crate) struct MemTableIteratorInner<T: RangeBounds<KVTableInternalKey>> {
-    map: Arc<SkipMap<KVTableInternalKey, RowEntry>>,
+pub(crate) struct SegmentIteratorInner<T: RangeBounds<KVArrayInternalKey>> {
+    map: Arc<Vec<(KVTableInternalKey, RowEntry)>>,
     /// `inner` is the Iterator impl of SkipMap, which is the underlying data structure of MemTable.
     #[borrows(map)]
     #[not_covariant]
@@ -61,10 +61,10 @@ pub(crate) struct MemTableIteratorInner<T: RangeBounds<KVTableInternalKey>> {
     ordering: IterationOrder,
     item: Option<RowEntry>,
 }
-pub(crate) type MemTableIterator = MemTableIteratorInner<KVTableInternalKeyRange>;
+pub(crate) type SegmentIterator = SegmentIteratorInner<KVArrayInternalKeyRange>;
 
 #[async_trait]
-impl KeyValueIterator for MemTableIterator {
+impl KeyValueIterator for SegmentIterator {
     async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         Ok(self.next_entry_sync())
     }
@@ -81,10 +81,10 @@ impl KeyValueIterator for MemTableIterator {
     }
 }
 
-impl KVTable {
+impl KVArray {
   pub(crate) fn new() -> Self {
       Self {
-          map: Arc::new(SkipMap::new()),
+          map: Arc::new(Vec::new()),
           entries_size_in_bytes: AtomicUsize::new(0),
           durable: WatchableOnceCell::new(),
           last_tick: AtomicI64::new(i64::MIN),
@@ -178,3 +178,20 @@ impl KVTable {
   }
 }
 
+#[async_trait]
+impl KeyValueIterator for MemTableIterator {
+    async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        Ok(self.next_entry_sync())
+    }
+
+    async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        loop {
+            let front = self.borrow_item().clone();
+            if front.is_some_and(|record| record.key < next_key) {
+                self.next_entry_sync();
+            } else {
+                return Ok(());
+            }
+        }
+    }
+}

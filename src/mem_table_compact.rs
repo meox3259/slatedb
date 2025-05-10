@@ -21,9 +21,32 @@ use crate::utils::WatchableOnceCell;
 use crate::mem_table::KVTableInternalKey;
 use crate::mem_table::KVTableInternalKeyRange;
 use crate::mem_table::MemTableIterator;
-use crate::mem_table::MemTableIteratorInner;
-use crate::mem_table::MemTableIterator;
-use crate::mem_table::MemTableIterator;
+use crate::merge_iterator::MergeIterator;
+
+pub(crate) struct KVArrayInternalKey {
+    user_key: Bytes,
+    seq: u64,
+}
+
+impl KVArrayInternalKey {
+    pub fn new(user_key: Bytes, seq: u64) -> Self {
+        Self { user_key, seq }
+    }
+}
+
+impl Ord for KVArrayInternalKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.user_key
+            .cmp(&other.user_key)
+            .then(self.seq.cmp(&other.seq).reverse())
+    }
+}
+
+impl PartialOrd for KVArrayInternalKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 pub(crate) struct KVArray {
   map: Arc<Vec<(KVTableInternalKey, RowEntry)>>,
@@ -57,11 +80,16 @@ pub(crate) struct SegmentIteratorInner<T: RangeBounds<KVArrayInternalKey>> {
     /// `inner` is the Iterator impl of SkipMap, which is the underlying data structure of MemTable.
     #[borrows(map)]
     #[not_covariant]
-    inner: Range<'this, KVTableInternalKey, T, KVTableInternalKey, RowEntry>,
+    inner: Range<'this, KVArrayInternalKey, T, KVArrayInternalKey, RowEntry>,
     ordering: IterationOrder,
     item: Option<RowEntry>,
 }
 pub(crate) type SegmentIterator = SegmentIteratorInner<KVArrayInternalKeyRange>;
+
+pub(crate) struct KVArrayInternalKeyRange {
+    start_bound: Bound<KVArrayInternalKey>,
+    end_bound: Bound<KVArrayInternalKey>,
+}
 
 #[async_trait]
 impl KeyValueIterator for SegmentIterator {
@@ -81,37 +109,50 @@ impl KeyValueIterator for SegmentIterator {
     }
 }
 
+pub(crate) struct KVArrayMetadata {
+    pub(crate) entry_num: usize,
+    pub(crate) entries_size_in_bytes: usize,
+    /// this corresponds to the timestamp of the most recent
+    /// modifying operation on this KVTable (insertion or deletion)
+    #[allow(dead_code)]
+    pub(crate) last_tick: i64,
+    /// the sequence number of the most recent operation on this KVTable
+    #[allow(dead_code)]
+    pub(crate) last_seq: u64,
+}
+
+
 impl KVArray {
-  pub(crate) fn new() -> Self {
-      Self {
-          map: Arc::new(Vec::new()),
-          entries_size_in_bytes: AtomicUsize::new(0),
-          durable: WatchableOnceCell::new(),
-          last_tick: AtomicI64::new(i64::MIN),
-          last_seq: AtomicU64::new(0),
-      }
-  }
+    pub(crate) fn new() -> Self {
+        Self {
+            map: Arc::new(Vec::new()),
+            entries_size_in_bytes: AtomicUsize::new(0),
+            durable: WatchableOnceCell::new(),
+            last_tick: AtomicI64::new(i64::MIN),
+            last_seq: AtomicU64::new(0),
+        }
+    }
 
-  pub(crate) fn metadata(&self) -> KVTableMetadata {
-      let entry_num = self.map.len();
-      let entries_size_in_bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
-      let last_tick = self.last_tick.load(SeqCst);
-      let last_seq = self.last_seq.load(SeqCst);
-      KVTableMetadata {
-          entry_num,
-          entries_size_in_bytes,
-          last_tick,
-          last_seq,
-      }
-  }
+    pub(crate) fn metadata(&self) -> KVArrayMetadata {
+        let entry_num = self.map.len();
+        let entries_size_in_bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
+        let last_tick = self.last_tick.load(SeqCst);
+        let last_seq = self.last_seq.load(SeqCst);
+        KVArrayMetadata {
+            entry_num,
+            entries_size_in_bytes,
+            last_tick,
+            last_seq,
+        }
+    }
 
-  pub(crate) fn is_empty(&self) -> bool {
-      self.map.is_empty()
-  }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 
-  pub(crate) fn last_tick(&self) -> i64 {
-      self.last_tick.load(SeqCst)
-  }
+    pub(crate) fn last_tick(&self) -> i64 {
+        self.last_tick.load(SeqCst)
+    }
 
   pub(crate) fn last_seq(&self) -> Option<u64> {
       if self.is_empty() {
@@ -133,7 +174,7 @@ impl KVArray {
           Bound::Included(user_key),
       ));
       self.map
-          .range(range)
+          .binary_search_by(|entry| entry.key().cmp(&range))
           .find(|entry| {
               if let Some(max_seq) = max_seq {
                   entry.key().seq <= max_seq
@@ -158,7 +199,7 @@ impl KVArray {
       ordering: IterationOrder,
   ) -> MemTableIterator {
       let internal_range = KVTableInternalKeyRange::from(range);
-      let mut iterator = MemTableIteratorInnerBuilder {
+      let mut iterator = SegmentIteratorInnerBuilder {
           map: self.map.clone(),
           inner_builder: |map| map.range(internal_range),
           ordering,
@@ -179,7 +220,7 @@ impl KVArray {
 }
 
 #[async_trait]
-impl KeyValueIterator for MemTableIterator {
+impl KeyValueIterator for SegmentIterator {
     async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
         Ok(self.next_entry_sync())
     }
@@ -193,5 +234,86 @@ impl KeyValueIterator for MemTableIterator {
                 return Ok(());
             }
         }
+    }
+}
+
+
+struct ImmutableSegment {
+    last_wal_id: u64,
+    table: Arc<KVArray>,
+    flushed: WatchableOnceCell<Result<(), SlateDBError>>,
+}
+
+impl ImmutableSegment {
+    fn new(iter: MergeIterator) -> Self {
+        let table = Arc::new(KVArray::new());
+        while let Some(entry) = iter.next_entry().await? {
+            table.push(entry.key, entry.value);
+        }
+        Self { 
+            last_wal_id: 0,
+            table,
+            flushed: WatchableOnceCell::new(),
+        }
+    }
+
+    pub(crate) fn table(&self) -> Arc<KVArray> {
+        self.table.clone()
+    }
+
+    pub(crate) fn last_wal_id(&self) -> u64 {
+        self.last_wal_id
+    }
+
+    pub(crate) async fn await_flush_to_l0(&self) -> Result<(), SlateDBError> {
+        self.flushed.reader().await_value().await
+    }
+
+    pub(crate) fn notify_flush_to_l0(&self, result: Result<(), SlateDBError>) {
+        self.flushed.write(result);
+    }
+}
+
+struct PipeLine {
+    pipeline: LinkedList<ImmutableSegment>,
+}
+
+enum CompactionAction {
+    Merge,
+    Compact,
+}
+
+impl PipeLine {
+    fn new() -> Self {
+        Self { pipeline: LinkedList::new() }
+    }
+
+    fn compact(&mut self) {
+        let head = self.pipeline.pop_front().unwrap();
+        let tail = self.pipeline.pop_back().unwrap();
+        let compacted = head.compact(tail);
+        self.pushHead(compacted);
+    }
+
+    fn doCompaction(&mut self, action: CompactionAction) {
+        match action {
+            CompactionAction::Merge => {
+                let mut iter = MergeIterator::new(self.pipeline.iter().map(|s| s.iter()));
+                let result = ImmutableSegment::new(iter);
+                return result;
+            }
+
+            _ => { // 使用 '_' 匹配所有其他情况 (类似 C++ 的 default)
+                println!("The number is something else");
+            }
+        }
+    }
+
+    fn pushHead(&mut self, segment: MutableSegment) {
+        self.pipeline.push_front(segment);
+    }
+
+    fn pushTail(&mut self, segment: ImmutableSegment) {
+        self.pipeline.push_back(segment);
     }
 }

@@ -3,7 +3,7 @@ use crate::checkpoint::Checkpoint;
 use crate::config::CompressionCodec;
 use crate::error::SlateDBError;
 use crate::manifest::store::DirtyManifest;
-use crate::mem_table::{ImmutableMemtable, ImmutableWal, KVTable, WritableKVTable};
+use crate::mem_table::{ImmutableMemtable, ImmutableWal, KVTable, Table, WritableKVTable, ImmutableSegment};
 use crate::reader::ReadSnapshot;
 use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
 use bytes::Bytes;
@@ -18,6 +18,12 @@ use tracing::debug;
 use ulid::Ulid;
 use uuid::Uuid;
 use SsTableId::{Compacted, Wal};
+
+enum CompactionAction {
+    Merge,
+    Compact,
+    Flatten,
+}
 
 #[derive(Clone, PartialEq, Serialize)]
 pub(crate) struct SsTableHandle {
@@ -220,7 +226,7 @@ pub(crate) struct DbState {
 // represents the state that is mutated by creating a new copy with the mutations
 #[derive(Clone)]
 pub(crate) struct COWDbState {
-    pub(crate) imm_memtable: VecDeque<Arc<ImmutableMemtable>>,
+    pub(crate) imm_memtable: VecDeque<Arc<dyn Table>>,
     pub(crate) imm_wal: VecDeque<Arc<ImmutableWal>>,
     pub(crate) manifest: DirtyManifest,
 }
@@ -228,6 +234,62 @@ pub(crate) struct COWDbState {
 impl COWDbState {
     pub(crate) fn core(&self) -> &CoreDbState {
         &self.manifest.core
+    }
+}
+
+// compaction pipeline
+impl COWDbState {
+    pub(crate) fn push_tail(&mut self, segment: Arc<dyn Table>) {
+        self.imm_memtable.push_back(segment);
+    }
+
+    pub(crate) fn flatten_one_segment(&mut self) -> Result<(), SlateDBError> {
+        let mut index: usize = -1;  
+        for segment in self.imm_memtable {
+            index += 1;
+            if segment.can_be_flattened() {
+                if segment.is_empty() {
+                    continue;
+                }
+                let new_flattened_segment = ImmutableSegment::new(segment.table(), segment.last_wal_id());
+                pipeline[index] = new_flattened_segment;
+                self.version.fetch_add(1, Ordering::Release);
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn create_subsitution(&mut self) -> Result<(), SlateDBError> {
+        let mut iters = Vec::new();
+        for segment in self.imm_memtable {
+            iters.push(segment.iter());
+        }
+        let iter = MergeIterator::new(iters);
+        let new_segment = ImmutableSegment::new(iter, self.last_wal_id());
+        Ok(new_segment)
+    }
+
+    fn remove_suffix_segments(&mut self, segments: LinkedList<ImmutableSegment>) -> Result<(), SlateDBError> {
+        if segments.size() > self.pipeline.size() {
+            return Err(SlateDBError::new("segments.size() > self.pipeline.size()"));
+        }
+        let mut pipeline = self.pipeline.lock();
+        while suffix.size() > 0 {
+            let suffix_segment = suffix.pop_front().unwrap();
+            let pipeline_segment = pipeline.pop_front().unwrap();
+            if suffix_segment != pipeline_segment {
+                return Err(SlateDBError::new("segments.size() > self.pipeline.size()"));
+            }
+        }
+        return Ok(());
+    }
+
+    pub(crate) fn do_compaction(&mut self, action: CompactionAction) -> Result<(), SlateDBError> {
+        match action {
+            CompactionAction::Flatten => self.flatten_one_segment(),
+            _ => Err(SlateDBError::new("Unsupported compaction action")),
+        }
     }
 }
 

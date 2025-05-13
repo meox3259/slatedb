@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::intrinsics::mir::PtrMetadata;
 use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -10,7 +11,8 @@ use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering::SeqCst;
-use std::collections::LinkedList;
+use std::collections::{LinkedList, VecDeque};
+use std::sync::Mutex;
 
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
@@ -236,8 +238,6 @@ impl KeyValueIterator for SegmentIterator {
         }
     }
 }
-
-
 struct ImmutableSegment {
     last_wal_id: u64,
     table: Arc<KVArray>,
@@ -245,7 +245,7 @@ struct ImmutableSegment {
 }
 
 impl ImmutableSegment {
-    fn new(iter: MergeIterator) -> Self {
+    pub(crate) async fn new(iter: MergeIterator) -> Self {
         let table = Arc::new(KVArray::new());
         while let Some(entry) = iter.next_entry().await? {
             table.push(entry.key, entry.value);
@@ -253,6 +253,14 @@ impl ImmutableSegment {
         Self { 
             last_wal_id: 0,
             table,
+            flushed: WatchableOnceCell::new(),
+        }
+    }
+
+    pub(crate) fn new(table: WritableKVTable, last_wal_id: u64) -> Self {
+        Self {
+            last_wal_id,
+            table: table.table,
             flushed: WatchableOnceCell::new(),
         }
     }
@@ -275,7 +283,9 @@ impl ImmutableSegment {
 }
 
 struct PipeLine {
-    pipeline: LinkedList<ImmutableSegment>,
+    pipeline: Arc<Mutex<VecDeque<ImmutableSegment>>>,
+    read_only: Arc<Mutex<VecDeque<ImmutableSegment>>>,
+    version: AtomicUsize,
 }
 
 enum CompactionAction {
@@ -285,7 +295,11 @@ enum CompactionAction {
 
 impl PipeLine {
     fn new() -> Self {
-        Self { pipeline: LinkedList::new() }
+        Self { 
+            pipeline: Arc::new(Mutex::new(VecDeque::new())), 
+            read_only: Arc::new(Mutex::new(VecDeque::new())),
+            version: AtomicUsize::new(0),
+        }
     }
 
     fn compact(&mut self) {
@@ -295,12 +309,11 @@ impl PipeLine {
         self.pushHead(compacted);
     }
 
-    fn doCompaction(&mut self, action: CompactionAction) {
+    fn doCompaction(&mut self, action: CompactionAction) -> Result<(), SlateDBError> {
         match action {
-            CompactionAction::Merge => {
-                let mut iter = MergeIterator::new(self.pipeline.iter().map(|s| s.iter()));
-                let result = ImmutableSegment::new(iter);
-                return result;
+            CompactionAction::Compact => {
+                let mut result = self.createSubsitution();
+                self.swapSegments(result)
             }
 
             _ => { // 使用 '_' 匹配所有其他情况 (类似 C++ 的 default)
@@ -309,11 +322,59 @@ impl PipeLine {
         }
     }
 
+    fn createSubsitution(&mut self) -> Result<(), SlateDBError> {
+        let head = self.pipeline.pop_front().unwrap();
+        let tail = self.pipeline.pop_back().unwrap();
+        let compacted = head.compact(tail);
+
+        self.pushHead(compacted);
+        Ok(())
+    }
+
+    fn removeSuffixSegments(&mut self, segments: LinkedList<ImmutableSegment>) -> Result<(), SlateDBError> {
+        if segments.size() > self.pipeline.size() {
+            return Err(SlateDBError::new("segments.size() > self.pipeline.size()"));
+        }
+        let mut pipeline = self.pipeline.lock();
+        while suffix.size() > 0 {
+            let suffix_segment = suffix.pop_front().unwrap();
+            let pipeline_segment = pipeline.pop_front().unwrap();
+            if suffix_segment != pipeline_segment {
+                return Err(SlateDBError::new("segments.size() > self.pipeline.size()"));
+            }
+        }
+        return Ok(());
+    }
+
     fn pushHead(&mut self, segment: MutableSegment) {
         self.pipeline.push_front(segment);
+        // 这里需要锁住
+        self.read_only = self.pipeline.lock().clone();
     }
 
     fn pushTail(&mut self, segment: ImmutableSegment) {
         self.pipeline.push_back(segment);
+        // 这里需要锁住
+        self.read_only = self.pipeline.lock().clone();
+    }
+}
+
+impl PipeLine {
+    fn flattenOneSegment(&mut self) -> Result<(), SlateDBError> {
+        let mut pipeline = self.pipeline.lock();
+        let mut index = 0;  
+        for segment in pipeline.iter_mut() {
+            index += 1;
+            if segment.canBeFlattened() {
+                if segment.empty() {
+                    continue;
+                }
+            }
+            let new_segment = ImmutableSegment::new(segment.table(), segment.last_wal_id());
+            pipeline[index] = new_segment;
+            self.version.fetch_add(1, Ordering::Release);
+            break;
+        }
+        Ok(())
     }
 }

@@ -17,6 +17,20 @@ use crate::iter::{IterationOrder, KeyValueIterator};
 use crate::types::RowEntry;
 use crate::utils::WatchableOnceCell;
 
+pub(crate) trait Table {
+    fn get(&self, key: &[u8], max_seq: Option<u64>) -> Option<RowEntry>;
+    fn iter(&self) -> MemTableIterator;
+    fn range_ascending<T: RangeBounds<Bytes>>(&self, range: T) -> MemTableIterator;
+    fn range<T: RangeBounds<Bytes>>(&self, range: T, ordering: IterationOrder) -> MemTableIterator;
+    fn is_empty(&self) -> bool;
+    fn last_tick(&self) -> i64;
+    fn last_seq(&self) -> Option<u64>;
+    fn metadata(&self) -> KVTableMetadata;
+    fn notify_durable(&self, result: Result<(), SlateDBError>);
+    fn await_durable(&self) -> Result<(), SlateDBError>;
+    fn can_be_flattened(&self) -> bool;
+}
+
 /// Memtable may contains multiple versions of a single user key, with a monotonically increasing sequence number.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct KVTableInternalKey {
@@ -152,6 +166,17 @@ impl KeyValueIterator for MemTableIterator {
     }
 }
 
+pub(crate) struct KVArray {
+    map: Arc<Vec<(KVTableInternalKey, RowEntry)>>,
+    durable: WatchableOnceCell<Result<(), SlateDBError>>,
+    entries_size_in_bytes: AtomicUsize,
+    /// this corresponds to the timestamp of the most recent
+    /// modifying operation on this KVTable (insertion or deletion)
+    last_tick: AtomicI64,
+    /// the sequence number of the most recent operation on this KVTable
+    last_seq: AtomicU64,
+}
+
 impl MemTableIterator {
     pub(crate) fn next_entry_sync(&mut self) -> Option<RowEntry> {
         let ans = self.borrow_item().clone();
@@ -238,83 +263,6 @@ impl KVTable {
         }
     }
 
-    pub(crate) fn metadata(&self) -> KVTableMetadata {
-        let entry_num = self.map.len();
-        let entries_size_in_bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
-        let last_tick = self.last_tick.load(SeqCst);
-        let last_seq = self.last_seq.load(SeqCst);
-        KVTableMetadata {
-            entry_num,
-            entries_size_in_bytes,
-            last_tick,
-            last_seq,
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-
-    pub(crate) fn last_tick(&self) -> i64 {
-        self.last_tick.load(SeqCst)
-    }
-
-    pub(crate) fn last_seq(&self) -> Option<u64> {
-        if self.is_empty() {
-            None
-        } else {
-            let last_seq = self.last_seq.load(SeqCst);
-            Some(last_seq)
-        }
-    }
-
-    /// Get the value for a given key.
-    /// Returns None if the key is not in the memtable at all,
-    /// Some(None) if the key is in the memtable but has a tombstone value,
-    /// Some(Some(value)) if the key is in the memtable with a non-tombstone value.
-    pub(crate) fn get(&self, key: &[u8], max_seq: Option<u64>) -> Option<RowEntry> {
-        let user_key = Bytes::from(key.to_vec());
-        let range = KVTableInternalKeyRange::from(BytesRange::new(
-            Bound::Included(user_key.clone()),
-            Bound::Included(user_key),
-        ));
-        self.map
-            .range(range)
-            .find(|entry| {
-                if let Some(max_seq) = max_seq {
-                    entry.key().seq <= max_seq
-                } else {
-                    true
-                }
-            })
-            .map(|entry| entry.value().clone())
-    }
-
-    pub(crate) fn iter(&self) -> MemTableIterator {
-        self.range_ascending(..)
-    }
-
-    pub(crate) fn range_ascending<T: RangeBounds<Bytes>>(&self, range: T) -> MemTableIterator {
-        self.range(range, IterationOrder::Ascending)
-    }
-
-    pub(crate) fn range<T: RangeBounds<Bytes>>(
-        &self,
-        range: T,
-        ordering: IterationOrder,
-    ) -> MemTableIterator {
-        let internal_range = KVTableInternalKeyRange::from(range);
-        let mut iterator = MemTableIteratorInnerBuilder {
-            map: self.map.clone(),
-            inner_builder: |map| map.range(internal_range),
-            ordering,
-            item: None,
-        }
-        .build();
-        iterator.next_entry_sync();
-        iterator
-    }
-
     fn put(&self, row: RowEntry) {
         let internal_key = KVTableInternalKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);
@@ -348,16 +296,201 @@ impl KVTable {
                 .fetch_add(row_size, Ordering::Relaxed);
         }
     }
+}
 
-    pub(crate) async fn await_durable(&self) -> Result<(), SlateDBError> {
+impl Table for KVTable {
+    fn metadata(&self) -> KVTableMetadata {
+        let entry_num = self.map.len();
+        let entries_size_in_bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
+        let last_tick = self.last_tick.load(SeqCst);
+        let last_seq = self.last_seq.load(SeqCst);
+        KVTableMetadata {
+            entry_num,
+            entries_size_in_bytes,
+            last_tick,
+            last_seq,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn last_tick(&self) -> i64 {
+        self.last_tick.load(SeqCst)
+    }
+
+    fn last_seq(&self) -> Option<u64> {
+        if self.is_empty() {
+            None
+        } else {
+            let last_seq = self.last_seq.load(SeqCst);
+            Some(last_seq)
+        }
+    }
+
+    /// Get the value for a given key.
+    /// Returns None if the key is not in the memtable at all,
+    /// Some(None) if the key is in the memtable but has a tombstone value,
+    /// Some(Some(value)) if the key is in the memtable with a non-tombstone value.
+    fn get(&self, key: &[u8], max_seq: Option<u64>) -> Option<RowEntry> {
+        let user_key = Bytes::from(key.to_vec());
+        let range = KVTableInternalKeyRange::from(BytesRange::new(
+            Bound::Included(user_key.clone()),
+            Bound::Included(user_key),
+        ));
+        self.map
+            .range(range)
+            .find(|entry| {
+                if let Some(max_seq) = max_seq {
+                    entry.key().seq <= max_seq
+                } else {
+                    true
+                }
+            })
+            .map(|entry| entry.value().clone())
+    }
+
+    fn iter(&self) -> MemTableIterator {
+        self.range_ascending(..)
+    }
+
+    fn range_ascending<T: RangeBounds<Bytes>>(&self, range: T) -> MemTableIterator {
+        self.range(range, IterationOrder::Ascending)
+    }
+
+    fn range<T: RangeBounds<Bytes>>(
+        &self,
+        range: T,
+        ordering: IterationOrder,
+    ) -> MemTableIterator {
+        let internal_range = KVTableInternalKeyRange::from(range);
+        let mut iterator = MemTableIteratorInnerBuilder {
+            map: self.map.clone(),
+            inner_builder: |map| map.range(internal_range),
+            ordering,
+            item: None,
+        }
+        .build();
+        iterator.next_entry_sync();
+        iterator
+    }
+
+    async fn await_durable(&self) -> Result<(), SlateDBError> {
         self.durable.reader().await_value().await
     }
 
-    pub(crate) fn notify_durable(&self, result: Result<(), SlateDBError>) {
+    fn notify_durable(&self, result: Result<(), SlateDBError>) {
         self.durable.write(result);
+    }
+
+    fn can_be_flattened(&self) -> bool {
+        true
     }
 }
 
+impl KVArray {
+    fn new() -> Self {
+        Self {
+            map: Arc::new(Vec::new()),
+            entries_size_in_bytes: AtomicUsize::new(0),
+            durable: WatchableOnceCell::new(),  
+            last_tick: AtomicI64::new(i64::MIN),
+            last_seq: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Table for KVArray {
+    fn metadata(&self) -> KVTableMetadata {
+        let entry_num = self.map.len();
+        let entries_size_in_bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
+        let last_tick = self.last_tick.load(SeqCst);
+        let last_seq = self.last_seq.load(SeqCst);
+        KVTableMetadata {
+            entry_num,
+            entries_size_in_bytes,
+            last_tick,
+            last_seq,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn last_tick(&self) -> i64 {
+        self.last_tick.load(SeqCst)
+    }
+
+    fn last_seq(&self) -> Option<u64> {
+        if self.is_empty() {
+            None
+        } else {
+            let last_seq = self.last_seq.load(SeqCst);
+            Some(last_seq)
+        }
+    }
+
+    /// Get the value for a given key.
+    /// Returns None if the key is not in the memtable at all,
+    /// Some(None) if the key is in the memtable but has a tombstone value,
+    /// Some(Some(value)) if the key is in the memtable with a non-tombstone value.
+    fn get(&self, key: &[u8], max_seq: Option<u64>) -> Option<RowEntry> {
+        let user_key = Bytes::from(key.to_vec());
+        let range = KVTableInternalKeyRange::from(BytesRange::new(
+            Bound::Included(user_key.clone()),
+            Bound::Included(user_key),
+        ));
+        self.map
+            .range(range)
+            .find(|entry| {
+                if let Some(max_seq) = max_seq {
+                    entry.key().seq <= max_seq
+                } else {
+                    true
+                }
+            })
+            .map(|entry| entry.value().clone())
+    }
+
+    fn iter(&self) -> MemTableIterator {
+        self.range_ascending(..)
+    }
+
+    fn range_ascending<T: RangeBounds<Bytes>>(&self, range: T) -> MemTableIterator {
+        self.range(range, IterationOrder::Ascending)
+    }
+
+    fn range<T: RangeBounds<Bytes>>(
+        &self,
+        range: T,
+        ordering: IterationOrder,
+    ) -> MemTableIterator {
+        let internal_range = KVTableInternalKeyRange::from(range);
+        let mut iterator = MemTableIteratorInnerBuilder {
+            map: self.map.clone(),
+            inner_builder: |map| map.range(internal_range),
+            ordering,
+            item: None,
+        }
+        .build();
+        iterator.next_entry_sync();
+        iterator
+    }
+
+    async fn await_durable(&self) -> Result<(), SlateDBError> {
+        self.durable.reader().await_value().await
+    }
+
+    fn notify_durable(&self, result: Result<(), SlateDBError>) {
+        self.durable.write(result);
+    }
+
+    fn can_be_flattened(&self) -> bool {
+        false
+    }
+}
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;

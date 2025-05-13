@@ -76,7 +76,6 @@ mod garbage_collector;
 mod iter;
 mod manifest;
 mod mem_table;
-mod mem_table_compact;
 mod mem_table_flush;
 mod merge_iterator;
 mod merge_operator;

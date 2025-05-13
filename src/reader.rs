@@ -4,7 +4,7 @@ use crate::db_state::{CoreDbState, SortedRun, SsTableHandle};
 use crate::db_stats::DbStats;
 use crate::filter_iterator::FilterIterator;
 use crate::iter::KeyValueIterator;
-use crate::mem_table::{ImmutableMemtable, ImmutableWal, KVTable, MemTableIterator};
+use crate::mem_table::{ImmutableMemtable, ImmutableWal, KVTable, MemTableIterator, Table};
 use crate::reader::SstFilterResult::{
     FilterNegative, FilterPositive, RangeNegative, RangePositive,
 };

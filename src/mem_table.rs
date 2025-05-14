@@ -17,18 +17,22 @@ use crate::iter::{IterationOrder, KeyValueIterator};
 use crate::types::RowEntry;
 use crate::utils::WatchableOnceCell;
 
-pub(crate) trait Table {
+#[async_trait::async_trait]
+pub(crate) trait Table<'a>: Send + Sync {
     fn get(&self, key: &[u8], max_seq: Option<u64>) -> Option<RowEntry>;
-    fn iter(&self) -> MemTableIterator;
-    fn range_ascending<T: RangeBounds<Bytes>>(&self, range: T) -> MemTableIterator;
-    fn range<T: RangeBounds<Bytes>>(&self, range: T, ordering: IterationOrder) -> MemTableIterator;
     fn is_empty(&self) -> bool;
     fn last_tick(&self) -> i64;
     fn last_seq(&self) -> Option<u64>;
     fn metadata(&self) -> KVTableMetadata;
     fn notify_durable(&self, result: Result<(), SlateDBError>);
-    fn await_durable(&self) -> Result<(), SlateDBError>;
+    async fn await_durable<'b>(&'b self) -> Result<(), SlateDBError>;
     fn can_be_flattened(&self) -> bool;
+}
+
+pub(crate) trait RangedTable<'a>: Table<'a> {
+    fn range<T: RangeBounds<Bytes>>(&self, range: T, ordering: IterationOrder) -> MemTableIterator;
+    fn iter(&self) -> MemTableIterator;
+    fn range_ascending<T: RangeBounds<Bytes>>(&self, range: T) -> MemTableIterator;
 }
 
 /// Memtable may contains multiple versions of a single user key, with a monotonically increasing sequence number.
@@ -298,7 +302,7 @@ impl KVTable {
     }
 }
 
-impl Table for KVTable {
+impl<'a> Table<'a> for KVTable {
     fn metadata(&self) -> KVTableMetadata {
         let entry_num = self.map.len();
         let entries_size_in_bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
@@ -351,19 +355,21 @@ impl Table for KVTable {
             .map(|entry| entry.value().clone())
     }
 
-    fn iter(&self) -> MemTableIterator {
-        self.range_ascending(..)
+    async fn await_durable<'b>(&'b self) -> Result<(), SlateDBError> {
+        self.durable.reader().await_value().await
     }
 
-    fn range_ascending<T: RangeBounds<Bytes>>(&self, range: T) -> MemTableIterator {
-        self.range(range, IterationOrder::Ascending)
+    fn notify_durable(&self, result: Result<(), SlateDBError>) {
+        self.durable.write(result);
     }
 
-    fn range<T: RangeBounds<Bytes>>(
-        &self,
-        range: T,
-        ordering: IterationOrder,
-    ) -> MemTableIterator {
+    fn can_be_flattened(&self) -> bool {
+        true
+    }
+}
+
+impl<'a> RangedTable<'a> for KVTable {
+    fn range<T: RangeBounds<Bytes>>(&self, range: T, ordering: IterationOrder) -> MemTableIterator {
         let internal_range = KVTableInternalKeyRange::from(range);
         let mut iterator = MemTableIteratorInnerBuilder {
             map: self.map.clone(),
@@ -376,16 +382,12 @@ impl Table for KVTable {
         iterator
     }
 
-    async fn await_durable(&self) -> Result<(), SlateDBError> {
-        self.durable.reader().await_value().await
+    fn range_ascending<T: RangeBounds<Bytes>>(&self, range: T) -> MemTableIterator {
+        self.range(range, IterationOrder::Ascending)
     }
 
-    fn notify_durable(&self, result: Result<(), SlateDBError>) {
-        self.durable.write(result);
-    }
-
-    fn can_be_flattened(&self) -> bool {
-        true
+    fn iter(&self) -> MemTableIterator {
+        self.range_ascending(..)
     }
 }
 
@@ -401,7 +403,7 @@ impl KVArray {
     }
 }
 
-impl Table for KVArray {
+impl<'a> Table<'a> for KVArray {
     fn metadata(&self) -> KVTableMetadata {
         let entry_num = self.map.len();
         let entries_size_in_bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
@@ -454,6 +456,20 @@ impl Table for KVArray {
             .map(|entry| entry.value().clone())
     }
 
+    async fn await_durable(&'a self) -> Result<(), SlateDBError> {
+        self.durable.reader().await_value().await
+    }
+
+    fn notify_durable(&self, result: Result<(), SlateDBError>) {
+        self.durable.write(result);
+    }
+
+    fn can_be_flattened(&self) -> bool {
+        false
+    }
+}
+
+impl<'a> RangedTable<'a> for KVArray {
     fn iter(&self) -> MemTableIterator {
         self.range_ascending(..)
     }
@@ -478,19 +494,8 @@ impl Table for KVArray {
         iterator.next_entry_sync();
         iterator
     }
-
-    async fn await_durable(&self) -> Result<(), SlateDBError> {
-        self.durable.reader().await_value().await
-    }
-
-    fn notify_durable(&self, result: Result<(), SlateDBError>) {
-        self.durable.write(result);
-    }
-
-    fn can_be_flattened(&self) -> bool {
-        false
-    }
 }
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;

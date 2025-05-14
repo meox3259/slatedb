@@ -1,6 +1,6 @@
 use crate::db_state::{CoreDbState, SsTableId};
 use crate::iter::KeyValueIterator;
-use crate::mem_table::Table;
+use crate::mem_table::RangedTable;
 use crate::mem_table::WritableKVTable;
 use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::TableStore;

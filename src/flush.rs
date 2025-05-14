@@ -14,7 +14,7 @@ use crate::db_state::SsTableHandle;
 use crate::error::SlateDBError;
 use crate::error::SlateDBError::BackgroundTaskShutdown;
 use crate::iter::KeyValueIterator;
-use crate::mem_table::{ImmutableWal, KVTable, WritableKVTable};
+use crate::mem_table::{ImmutableWal, KVTable, RangedTable, WritableKVTable, Table};
 use crate::utils::{bg_task_result_into_err, spawn_bg_task};
 
 #[derive(Debug)]
@@ -32,10 +32,10 @@ impl DbInner {
         Ok(())
     }
 
-    pub(crate) async fn flush_imm_table(
+    pub(crate) async fn flush_imm_table<'a>(
         &self,
         id: &db_state::SsTableId,
-        imm_table: Arc<KVTable>,
+        imm_table: Arc<dyn Table<'a>>,
         write_cache: bool,
     ) -> Result<SsTableHandle, SlateDBError> {
         let mut sst_builder = self.table_store.table_builder();

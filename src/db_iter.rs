@@ -7,6 +7,7 @@ use crate::merge_iterator::MergeIterator;
 use crate::sorted_run_iterator::SortedRunIterator;
 use crate::sst_iter::SstIterator;
 use crate::types::KeyValue;
+use crate::mem_table::RangedTable;
 
 use bytes::Bytes;
 use std::ops::RangeBounds;

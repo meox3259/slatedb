@@ -3,9 +3,10 @@ use crate::checkpoint::Checkpoint;
 use crate::config::CompressionCodec;
 use crate::error::SlateDBError;
 use crate::manifest::store::DirtyManifest;
-use crate::mem_table::{ImmutableMemtable, ImmutableWal, KVTable, Table, WritableKVTable, ImmutableSegment};
+use crate::mem_table::{ImmutableMemtable, ImmutableWal, KVTable, Table, WritableKVTable};
 use crate::reader::ReadSnapshot;
 use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
+use crate::merge_iterator::MergeIterator;
 use bytes::Bytes;
 use serde::Serialize;
 use std::cmp;
@@ -215,47 +216,47 @@ impl SortedRun {
     }
 }
 
-pub(crate) struct DbState {
+pub(crate) struct DbState<'a> {
     memtable: WritableKVTable,
     wal: WritableKVTable,
-    state: Arc<COWDbState>,
+    state: Arc<COWDbState<'a>>,
     last_seq: u64,
     error: WatchableOnceCell<SlateDBError>,
 }
 
 // represents the state that is mutated by creating a new copy with the mutations
 #[derive(Clone)]
-pub(crate) struct COWDbState {
-    pub(crate) imm_memtable: VecDeque<Arc<dyn Table>>,
+pub(crate) struct COWDbState<'a> {
+    pub(crate) imm_memtable: VecDeque<Arc<dyn Table<'a>>>,
     pub(crate) imm_wal: VecDeque<Arc<ImmutableWal>>,
     pub(crate) manifest: DirtyManifest,
 }
 
-impl COWDbState {
+impl<'a> COWDbState<'a> {
     pub(crate) fn core(&self) -> &CoreDbState {
         &self.manifest.core
     }
 }
 
 // compaction pipeline
-impl COWDbState {
-    pub(crate) fn push_tail(&mut self, segment: Arc<dyn Table>) {
+impl<'a> COWDbState<'a> {
+    pub(crate) fn push_tail(&mut self, segment: Arc<dyn Table<'a>>) {
         self.imm_memtable.push_back(segment);
     }
 
     pub(crate) fn flatten_one_segment(&mut self) -> Result<(), SlateDBError> {
-        let mut index: usize = -1;  
+        let mut index = 0;  
         for segment in self.imm_memtable {
-            index += 1;
             if segment.can_be_flattened() {
                 if segment.is_empty() {
                     continue;
                 }
-                let new_flattened_segment = ImmutableSegment::new(segment.table(), segment.last_wal_id());
-                pipeline[index] = new_flattened_segment;
-                self.version.fetch_add(1, Ordering::Release);
+            //    let new_flattened_segment = ImmutableSegment::new(segment.table(), segment.last_wal_id());
+            //    pipeline[index] = new_flattened_segment;
+            //    self.version.fetch_add(1, Ordering::Release);
                 break;
             }
+            index += 1;
         }
         Ok(())
     }
@@ -270,15 +271,15 @@ impl COWDbState {
         Ok(new_segment)
     }
 
-    fn remove_suffix_segments(&mut self, segments: LinkedList<ImmutableSegment>) -> Result<(), SlateDBError> {
-        if segments.size() > self.pipeline.size() {
+    fn remove_suffix_segments(&mut self, segments: Vec<Arc<dyn Table<'a>>>) -> Result<(), SlateDBError> {
+        if segments.size() > self.imm_memtable.size() {
             return Err(SlateDBError::new("segments.size() > self.pipeline.size()"));
         }
-        let mut pipeline = self.pipeline.lock();
-        while suffix.size() > 0 {
-            let suffix_segment = suffix.pop_front().unwrap();
-            let pipeline_segment = pipeline.pop_front().unwrap();
-            if suffix_segment != pipeline_segment {
+        let mut imm_memtable = self.imm_memtable.lock();
+        while segments.size() > 0 {
+            let suffix_segment = segments.pop_front().unwrap();
+            let imm_memtable_segment = imm_memtable.pop_front().unwrap();
+            if suffix_segment != imm_memtable_segment {
                 return Err(SlateDBError::new("segments.size() > self.pipeline.size()"));
             }
         }
@@ -355,13 +356,13 @@ impl CoreDbState {
 
 // represents a read-snapshot of the current db state
 #[derive(Clone)]
-pub(crate) struct DbStateSnapshot {
+pub(crate) struct DbStateSnapshot<'a> {
     pub(crate) memtable: Arc<KVTable>,
     pub(crate) wal: Arc<KVTable>,
-    pub(crate) state: Arc<COWDbState>,
+    pub(crate) state: Arc<COWDbState<'a>>,
 }
 
-impl ReadSnapshot for DbStateSnapshot {
+impl<'a> ReadSnapshot for DbStateSnapshot<'a> {
     fn memtable(&self) -> Arc<KVTable> {
         Arc::clone(&self.memtable)
     }
@@ -370,7 +371,7 @@ impl ReadSnapshot for DbStateSnapshot {
         Arc::clone(&self.wal)
     }
 
-    fn imm_memtable(&self) -> &VecDeque<Arc<ImmutableMemtable>> {
+    fn imm_memtable(&self) -> &VecDeque<Arc<dyn Table<'a>>> {
         &self.state.imm_memtable
     }
 
@@ -383,7 +384,7 @@ impl ReadSnapshot for DbStateSnapshot {
     }
 }
 
-impl DbState {
+impl<'a> DbState<'a> {
     pub fn new(manifest: DirtyManifest) -> Self {
         let last_l0_seq = manifest.core.last_l0_seq;
         Self {
